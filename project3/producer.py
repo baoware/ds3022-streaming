@@ -1,91 +1,81 @@
-"""Earthquakes -> Kafka topic "quakes".
+"""Bluesky posts (Jetstream) -> Kafka topic "bluesky_posts".
 
-  python quakes_producer.py history 7   # PULL: the last 7 days from the EMSC catalogue
-  python quakes_producer.py live        # PUSH: new and updated events from the EMSC WebSocket
+  python producer.py              # PUSH: new posts and deletes from the Jetstream WebSocket
+  python producer.py history 60   # replay the last 60 minutes first (Jetstream cursor), then carry on live
 
-Adapted from Professor Magee's stream-seismic.py (learn-kafka).
+Adapted from the class quakes_producer.py (itself from Professor Magee's stream-seismic.py).
 """
 import asyncio
 import json
 import logging
 import sys
 import time
-from datetime import datetime, timedelta, timezone
 
-import requests
 from quixstreams import Application
 from tornado.websocket import websocket_connect
 
 BROKER = "127.0.0.1:19092"
-TOPIC = "quakes"
-FDSN_URL = "https://www.seismicportal.eu/fdsnws/event/1/query"
-WSS_URL = "wss://www.seismicportal.eu/standing_order/websocket"
+TOPIC = "bluesky_posts"
+# posts only: likes, follows and reposts are filtered out by Jetstream before they reach me
+WSS_URL = "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post"
+LOG_EVERY = 1000  # about one log line every 20 s at 50 posts per second
 
 
+# function to send one message to kafka keyed by the account id
 def send(producer, message):
-    """One Kafka record per message. Key = the event id, so every
-    version of the same earthquake goes to the same partition, in order."""
-    unid = message["data"]["properties"]["unid"]
-    producer.produce(topic=TOPIC, key=unid, value=json.dumps(message))
-    return unid
+    """One Kafka record per message. Key = did (the account), so every event
+    of one account goes to the same partition, in order: a post's create before its delete."""
+    did = message["data"].get("did")  # .get(): no crash if missing
+    if did is None:
+        logging.warning("No did: sent without a key")
+    producer.produce(topic=TOPIC, key=did, value=json.dumps(message))
+    return did
 
 
-def history(producer, days):
-    """PULL: ask the catalogue for one day at a time (far below the 20,000 limit)."""
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    total = 0
-    for back in range(days - 1, -1, -1):  # the last N days, today included
-        start = today - timedelta(days=back)
-        end = start + timedelta(days=1)
-        r = requests.get(
-            FDSN_URL,
-            params={
-                "start": start.strftime("%Y-%m-%dT%H:%M:%S"),
-                "end": end.strftime("%Y-%m-%dT%H:%M:%S"),
-                "format": "json",
-                "limit": 20000,
-                "orderby": "time-asc",
-            },
-            timeout=60,
-        )
-        if r.status_code == 204:  # no events that day
-            continue
-        r.raise_for_status()
-        features = r.json()["features"]
-        for feature in features:
-            send(producer, {"action": "history", "data": feature})
-        total += len(features)
-        logging.info("%s  %4d events   total %d", start.date(), len(features), total)
-        time.sleep(1)  # be polite to a free public service
-    logging.info("History done: %d events sent to %s", total, TOPIC)
-
-
-async def live(producer):
-    """PUSH: keep one connection open; EMSC sends each new or updated event."""
-    ws = await websocket_connect(WSS_URL, ping_interval=15)
-    logging.info("Connected. Waiting for earthquakes (often about one a minute)...")
+# function to read the jetstream websocket forever and reconnect when it drops
+async def live(producer, minutes_back=0):
+    """PUSH over a WebSocket, with a reconnect loop. Jetstream can replay from a
+    cursor (time_us), so after a drop I reconnect from the last message I sent."""
+    started_us = int(time.time() * 1e6)
+    # no cursor means start from now, otherwise start minutes_back ago
+    cursor = started_us - minutes_back * 60 * 1_000_000 if minutes_back else None
+    sent = skipped = 0
     while True:
-        text = await ws.read_message()
-        if text is None:
-            logging.warning("The server closed the connection")
-            break
+        url = WSS_URL + (f"&cursor={cursor}" if cursor else "")
         try:
-            message = json.loads(text)
-            unid = send(producer, message)
-            p = message["data"]["properties"]
-            logging.info("%-7s %s  M%s  %s", message.get("action"), unid, p.get("mag"), p.get("flynn_region"))
-        except (ValueError, KeyError, TypeError) as e:
-            logging.warning("Skipped a message I could not read: %r", e)
+            ws = await websocket_connect(url, ping_interval=15)
+            logging.info("Connected%s", f" from cursor {cursor}" if cursor else "")
+            while True:
+                text = await ws.read_message()
+                if text is None:
+                    logging.warning("The server closed the connection")
+                    break
+                try:
+                    data = json.loads(text)
+                    # replayed messages are older than the moment I started
+                    action = "history" if data.get("time_us", started_us) < started_us else "live"
+                    send(producer, {"action": action, "data": data})
+                except (ValueError, KeyError, TypeError, AttributeError) as e:
+                    skipped += 1
+                    logging.warning("Skipped a message I could not read (%d so far): %r", skipped, e)
+                    continue
+                # remember where I am so a reconnect picks up here
+                cursor = data.get("time_us", cursor)
+                sent += 1
+                if sent % LOG_EVERY == 0:
+                    logging.info("%d messages sent to %s (%d skipped)", sent, TOPIC, skipped)
+        except Exception as e:
+            logging.warning("Connection failed: %r", e)
+        logging.info("Reconnecting in 5 s (%d sent so far)", sent)
+        await asyncio.sleep(5)
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else "live"
+    # history N replays the last N minutes, anything else is live from now
+    minutes = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[1] == "history" else 0
     app = Application(broker_address=BROKER, loglevel="WARNING")
     with app.get_producer() as producer:
-        if mode == "history":
-            history(producer, int(sys.argv[2]) if len(sys.argv) > 2 else 7)
-        else:
-            asyncio.run(live(producer))
+        asyncio.run(live(producer, minutes))
 
 
 if __name__ == "__main__":
