@@ -70,6 +70,7 @@ async def live(producer, minutes_back=0):
         await asyncio.sleep(5)
 
 
+# function to start the producer, live or replaying the last n minutes
 def main():
     # history N replays the last N minutes, anything else is live from now
     minutes = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[1] == "history" else 0

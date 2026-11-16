@@ -30,6 +30,7 @@ SCHEMA = """kafka_partition INTEGER, kafka_offset BIGINT, kafka_key VARCHAR,
     landed_at TIMESTAMP, raw VARCHAR"""
 
 
+# function to turn a value into a float, or none if it is not a number (from the class script, unused here)
 def number(x):
     try:
         return float(x)
@@ -37,6 +38,7 @@ def number(x):
         return None
 
 
+# function to turn one kafka message into one row, landing bad input as malformed
 def to_row(msg):
     """Keep the whole message (raw) plus a few columns. Never crash on bad input."""
     raw = msg.value().decode("utf8", errors="replace") if msg.value() else ""
@@ -60,6 +62,7 @@ def to_row(msg):
             datetime.now(timezone.utc).replace(tzinfo=None), raw)
 
 
+# function to write one batch of rows to a parquet file
 def write_batch(rows):
     """Write one Parquet file. Write to .tmp first, then rename,
     so the flow never reads a half-written file."""
@@ -74,6 +77,7 @@ def write_batch(rows):
     return name
 
 
+# function to land the topic in batches and store offsets only after each file exists
 def main():
     app = Application(broker_address=BROKER, consumer_group="bluesky_posts_lander",
                       auto_offset_reset="earliest", loglevel="WARNING")
